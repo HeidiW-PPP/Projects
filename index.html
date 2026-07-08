@@ -32,7 +32,7 @@ body{font-family:'Barlow',ui-sans-serif,sans-serif;font-weight:300;font-size:10p
   20% {transform:translateX(7px) scale(1.04)}
   100%{opacity:0;transform:translateX(-26px) scale(0.68)}
 }
-#tooltip{position:fixed;z-index:200;pointer-events:none;transform:translateY(-50%)}
+#tooltip{position:fixed;left:0;top:0;z-index:200;pointer-events:none;transform:translateY(-50%);will-change:transform}
 #tooltip-inner{
   background:rgba(8,8,12,.93);
   backdrop-filter:blur(14px);
@@ -44,6 +44,7 @@ body{font-family:'Barlow',ui-sans-serif,sans-serif;font-weight:300;font-size:10p
   margin-left:10px;
   transform-origin:left center;
   opacity:0;
+  will-change:backdrop-filter,opacity,transform;
 }
 #tooltip.tt-on  #tooltip-inner{animation:tt-in  .50s cubic-bezier(.34,1.56,.64,1) forwards}
 #tooltip.tt-out #tooltip-inner{animation:tt-out .26s cubic-bezier(.55,0,1,.45)    forwards}
@@ -222,7 +223,7 @@ const _bgRender = (function () {
   // ─── Renderer ───────────────────────────────────────────────────────────────
   const canvas = document.getElementById('c');
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
   renderer.setSize(innerWidth, innerHeight);
   renderer.setClearColor(0x000000, 0);
 
@@ -268,6 +269,7 @@ const _bgRender = (function () {
   // ─── Build card groups ──────────────────────────────────────────────────────
   const loader = new THREE.TextureLoader();
   const groups = [];
+  const hitProxies = []; // cheap invisible planes used for raycasting instead of the rounded-corner faces
 
   TILES.forEach(t => {
     const { w, h } = t;
@@ -279,6 +281,11 @@ const _bgRender = (function () {
     grp.add(new THREE.Mesh(roundedRect(w, h, 0.09),
       new THREE.MeshBasicMaterial({ map: tex })));
 
+    // ── Hit-test proxy (simple quad, avoids raycasting the many-triangle rounded-corner shape) ──
+    const hitProxy = new THREE.Mesh(new THREE.PlaneGeometry(w, h));
+    hitProxy.visible = false;
+    grp.add(hitProxy);
+    hitProxies.push(hitProxy);
 
     grp.traverse(obj => { obj.frustumCulled = false; });
     scene.add(grp);
@@ -327,8 +334,10 @@ const _bgRender = (function () {
     ttVec.copy(groups[hoveredIdx].position);
     ttVec.x += TILES[hoveredIdx].w / 2;
     ttVec.project(camera);
-    tooltip.style.left = ((ttVec.x * 0.5 + 0.5) * innerWidth)  + 'px';
-    tooltip.style.top  = ((-ttVec.y * 0.5 + 0.5) * innerHeight) + 'px';
+    const x = (ttVec.x * 0.5 + 0.5) * innerWidth;
+    const y = (-ttVec.y * 0.5 + 0.5) * innerHeight;
+    // transform-only (no left/top) so positioning is compositor-only, not layout-triggering
+    tooltip.style.transform = `translate3d(${x}px, ${y}px, 0) translateY(-50%)`;
   }
 
   function posMod(a, b) { return ((a % b) + b) % b; }
@@ -337,19 +346,26 @@ const _bgRender = (function () {
   function update() {
     const base = Math.round(scrollPos);
     const frac = scrollPos - base;
+    const scrollSettled = Math.abs(target - scrollPos) < 0.0005;
     for (let i = 0; i < N; i++) {
+      const targetHover = (i === hoveredIdx) ? 1 : 0;
+      const delta = (targetHover - hoverOffsets[i]) * 0.05;
+      const grp = groups[i];
+      // Skip the write once settled — but every card must be positioned at least
+      // once first, or it's left stranded at its default (0,0,0) group position.
+      if (scrollSettled && Math.abs(delta) < 0.00005 && grp.userData.positioned) continue;
+      hoverOffsets[i] += delta;
       let slot = posMod(i - base, N);
       if (slot > 13) slot -= N;
       const s = slot - frac;
-      const targetHover = (i === hoveredIdx) ? 1 : 0;
-      hoverOffsets[i] += (targetHover - hoverOffsets[i]) * 0.05;
-      groups[i].position.set(
+      grp.position.set(
         STEP.x * s + hoverOffsets[i] * 1.1,
         STEP.y * s,
         STEP.z * s
       );
       const ro = Math.round(100 - s * 10);
-      groups[i].children.forEach(c => { c.renderOrder = ro; });
+      grp.children.forEach(c => { c.renderOrder = ro; });
+      grp.userData.positioned = true;
     }
   }
 
@@ -363,25 +379,32 @@ const _bgRender = (function () {
 
   // ─── Raycaster — hover cursor + click to open project ───────────────────────
   const raycaster = new THREE.Raycaster();
-  const mouse2d   = new THREE.Vector2();
-  const faces     = groups.map(g => g.children[0]); // face mesh is always first child
+  const mouse2d   = new THREE.Vector2(-2, -2); // start off-screen so nothing hits before first move
 
   function updateMouse(e) {
     mouse2d.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
   }
 
-  canvas.addEventListener('mousemove', e => {
-    updateMouse(e);
+  // Only record the latest pointer position here — the actual raycast (the
+  // expensive part) runs once per animation frame in updateHover(), not once
+  // per mousemove event (which can fire far faster than the display refresh rate).
+  let mouseInside = true;
+  canvas.addEventListener('mousemove', updateMouse);
+  canvas.addEventListener('mouseleave', () => { mouseInside = false; });
+  canvas.addEventListener('mouseenter', () => { mouseInside = true; });
+
+  function updateHover() {
+    if (!mouseInside) { hoveredIdx = -1; return; }
     raycaster.setFromCamera(mouse2d, camera);
-    const hits = raycaster.intersectObjects(faces);
+    const hits = raycaster.intersectObjects(hitProxies);
     if (hits.length) {
-      hoveredIdx = faces.indexOf(hits[0].object);
+      hoveredIdx = hitProxies.indexOf(hits[0].object);
       canvas.style.cursor = 'pointer';
     } else {
       hoveredIdx = -1;
       canvas.style.cursor = 'default';
     }
-  });
+  }
 
   let mouseDownX = 0, mouseDownY = 0;
   canvas.addEventListener('mousedown', e => { mouseDownX = e.clientX; mouseDownY = e.clientY; });
@@ -391,9 +414,9 @@ const _bgRender = (function () {
     if (Math.abs(e.clientX - mouseDownX) + Math.abs(e.clientY - mouseDownY) > 4) return;
     updateMouse(e);
     raycaster.setFromCamera(mouse2d, camera);
-    const hits = raycaster.intersectObjects(faces);
+    const hits = raycaster.intersectObjects(hitProxies);
     if (!hits.length) return;
-    const idx = faces.indexOf(hits[0].object);
+    const idx = hitProxies.indexOf(hits[0].object);
     if (idx >= 0 && PROJECTS[idx].id) {
       window.location.href = `project.html?id=${PROJECTS[idx].id}`;
     }
@@ -411,6 +434,7 @@ const _bgRender = (function () {
     requestAnimationFrame(animate);
     scrollPos += (target - scrollPos) * 0.10;
     if (_bgRender) _bgRender();
+    updateHover();
     update();
     updateTooltip();
     renderer.render(scene, camera);
